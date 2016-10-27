@@ -108,7 +108,7 @@ def create_model(session, forward_only):
         env.config.getint("model","size"),
         env.config.getint("model","num_layers"),
         env.config.getfloat("model","max_gradient_norm"),
-        env.config.getint("model","batch_size") * env.config.getint("model","num_z"),
+        env.config.getint("model","batch_size"),
         env.config.getfloat("model","learning_rate"),
         env.config.getfloat("model","learning_rate_decay_factor"),
         forward_only=forward_only)
@@ -136,7 +136,7 @@ def train():
     """Train a en->fr translation model using WMT data."""
     # Prepare WMT data.
     print("Preparing WMT data in %s" % env.config.get("model","data_dir"))
-    en_train, fr_train, type_train, en_dev, fr_dev, type_dev, en_test, fr_test, type_test, _, _ = data_utils.prepare_wmt_data(env.config.get("model","data_dir"), env.config.getint("model","en_vocab_size"),latent = True)
+    en_train, fr_train, type_train, en_dev, fr_dev, type_dev, en_test, fr_test, type_test, _, _ = data_utils.prepare_wmt_data(env.config.get("model","data_dir"), env.config.getint("model","en_vocab_size"),latent = True, n_sense = env.config.getint("model","num_z"))
 
     with tf.Session(config=tf.ConfigProto(log_device_placement=False, allow_soft_placement=True)) as sess:
 
@@ -276,6 +276,39 @@ def train():
     df.columns=["step","Q","L","cost", "Accuracy", "Train_ppx","Eval_ppx"]
     df.to_csv(os.path.join(env.config.get("model","train_dir"),"log.csv"))
 
+def precision_and_recall(gold_z,predict_z,num_z, omit_0 = False):
+    prefix = ""
+    counts = np.zeros((num_z,3)) # [#correct, #pre, #gold]
+    for i in xrange(len(gold_z)):
+        g = gold_z[i]
+        p = predict_z[i]
+        counts[g][2] += 1
+        counts[p][1] += 1
+        if g == p:
+            counts[g][0] += 1
+    if omit_0:
+        counts = counts[1:,:]
+        prefix = "#"
+
+    print(prefix+"counts:")
+    print(counts)
+    print(prefix+"Pre Recall F1")
+    prf = np.zeros((num_z,3))
+    
+    if omit_0:
+        prf = prf[1:,:]
+
+    prf[:,0] = counts[:,0] / counts[:,1]
+    prf[:,1] = counts[:,0] / counts[:,2]
+    prf[:,2] = 2 * prf[:,0] * prf[:,1] / (prf[:,0] + prf[:,1])
+    print(prf)
+
+    macro_f1 = np.average(prf[:,2])
+    accuracy = np.sum(counts[:,0]) / np.sum(counts[:,2])
+    print(prefix+"Macro F1",macro_f1 * 100.0)
+    print(prefix+"Accuracy", accuracy)
+    
+
 
 def evaluate(sess, model, data_set, _buckets, name = 'test',show_sample = False, show_stat = False,  show_basic = False):
     # Run evals on development set and print their perplexity.
@@ -286,6 +319,7 @@ def evaluate(sess, model, data_set, _buckets, name = 'test',show_sample = False,
 
     num_z = env.config.getint("model","num_z")
     batch_size = env.config.getint("model","batch_size")
+    withCompact = env.config.getboolean("model","withCompact")
     n = 0
     accuracy = 0
     predict_z = []
@@ -312,27 +346,63 @@ def evaluate(sess, model, data_set, _buckets, name = 'test',show_sample = False,
             sum_eval_Q += Q / batch_size
             n_steps_dev += 1
 
-            predict_z += list(np.argmax(np.reshape(post_z,[-1,num_z]), axis = 1))
-            for i in xrange(0,len(hiddens), num_z):
-                gold_z.append(hiddens[i][0])
+            if num_z == 5: 
+                temp = np.reshape(post_z,[-1,num_z])
+                temp[:,0] = 0.0
+                predict_z += list(np.argmax(temp, axis = 1))
+            else:
+                predict_z += list(np.argmax(np.reshape(post_z,[-1,num_z]), axis = 1))
 
-            for i in xrange(0,len(hiddens),num_z):
-                z_type = int(hiddens[i][0])
-                post_z_avg[z_type] += post_z.reshape([-1,num_z])[int(i/num_z)]
-                r = np.random.rand()
-                if show_sample and r < 0.002:
-                    print("z",z_type)
-                    #print(np.array(encoder_inputs).T[i])
-                    #print(np.array(decoder_inputs).T[i])         
-                    print("p(z|x)", np.exp(log_p_z.reshape([-1,num_z])[int(i/num_z)]))
-                    print("p(y|z,x)",np.exp(log_p_y_gv_z.reshape([-1,num_z])[int(i/num_z)]))
-                    print("p(z|x,y)",post_z.reshape([-1,num_z])[int(i/num_z)])
+
+            if withCompact:
+                gold_z += [x[0] for x in hiddens]
+                for i in xrange(0,len(hiddens)):
+                    z_type = int(hiddens[i][0])
+                    post_z_avg[z_type] += post_z.reshape([-1,num_z])[i]
+                    r = np.random.rand()
+                    if show_sample and r < 0.002:
+                        print("z",z_type)
+                        #print(np.array(encoder_inputs).T[i])
+                        #print(np.array(decoder_inputs).T[i])         
+                        print("p(z|x)", np.exp(log_p_z.reshape([-1,num_z])[i]))
+                        print("p(y|z,x)",np.exp(log_p_y_gv_z.reshape([-1,num_z])[i]))
+                        print("p(z|x,y)",post_z.reshape([-1,num_z])[i])
+
+
+            else:
+                for i in xrange(0,len(hiddens), num_z):
+                    gold_z.append(hiddens[i][0])
+            
+                for i in xrange(0,len(hiddens),num_z):
+                    z_type = int(hiddens[i][0])
+                    post_z_avg[z_type] += post_z.reshape([-1,num_z])[int(i/num_z)]
+                    r = np.random.rand()
+                    if show_sample and r < 0.002:
+                        print("z",z_type)
+                        #print(np.array(encoder_inputs).T[i])
+                        #print(np.array(decoder_inputs).T[i])         
+                        print("p(z|x)", np.exp(log_p_z.reshape([-1,num_z])[int(i/num_z)]))
+                        print("p(y|z,x)",np.exp(log_p_y_gv_z.reshape([-1,num_z])[int(i/num_z)]))
+                        print("p(z|x,y)",post_z.reshape([-1,num_z])[int(i/num_z)])
 
     post_z_avg = post_z_avg / np.sum(post_z_avg, axis = 1).reshape([-1,1])
 
     eval_ppx = math.exp(float(sum_eval_loss/n_steps_dev)) if sum_eval_loss/n_steps_dev < 300 else float("inf")
     Q = sum_eval_Q / n_steps_dev
     L = - sum_eval_loss / n_steps_dev
+
+
+    #print(gold_z)
+    #print(predict_z)
+    #print(len(gold_z))
+    #print(len(predict_z))
+
+    if num_z == 5:
+        for i in xrange(len(gold_z)):
+            if gold_z[i] == 0:
+                predict_z[i] = 0
+
+
 
     cost, indexes, matrix = get_matching_accuracy(gold_z, predict_z, num_z)
     accuracy = cost*1.0/n
@@ -341,7 +411,11 @@ def evaluate(sess, model, data_set, _buckets, name = 'test',show_sample = False,
             value = matrix[row][column]
             print('(%d, %d) -> %d' % (row, column, value))
         print('total cost: %d' % cost)
-        print('Accuracy: {:2f}'.format(cost*1.0 / n ))
+        #print('Accuracy: {:2f}'.format(cost*1.0 / n ))
+        precision_and_recall(gold_z,predict_z,num_z)
+        if num_z == 5:
+            precision_and_recall(gold_z,predict_z,num_z, True)
+            
         print()
         
     if show_stat:

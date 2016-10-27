@@ -176,6 +176,54 @@ def statistics():
     _stat(dev_path)
     _stat(test_path)
 
+def extract_paper():
+    def _extract(fn,dest_path, nway=5):
+        f = open(fn)
+        f1 = open(dest_path+".arg1",'w')
+        f2 = open(dest_path+".arg2",'w')
+        frl = open(dest_path+".rl",'w')
+
+        sents = []
+        rls = []
+        for line in f:
+            if line.startswith("=== "):
+                # process buff
+                for i in xrange(len(rls)-1):
+                    rl = rls[i]
+                    if nway == 4 and rl == -1:
+                        continue
+                    arg1 = sents[i]
+                    arg2 = sents[i+1]
+                    f1.write(arg1+"\n")
+                    f2.write(arg2+"\n")
+                    frl.write(str(rl)+"\n")
+                sents = []
+                rls = []
+            else:
+                ll = line.split("\t")
+                sents.append(ll[0])
+                rls.append(int(ll[1]))
+
+        f1.close()
+        f2.close()
+        frl.close()
+        f.close()
+
+    paper_dir = os.path.join(data_dir,"paper")
+    train_path = os.path.join(paper_dir,"trn-levelone.txt.10K")
+    dev_path = os.path.join(paper_dir,"dev-levelone.txt.10K")
+    test_path = os.path.join(paper_dir,"tst-levelone.txt.10K")
+    way4_dir = os.path.join(data_dir,"paper_4way")
+    way5_dir = os.path.join(data_dir,"paper_5way")
+    
+    _extract(train_path, way4_dir+"/train", 4)
+    _extract(dev_path, way4_dir+"/dev", 4)
+    _extract(test_path, way4_dir+"/test", 4)
+
+    _extract(train_path, way5_dir+"/train", 5)
+    _extract(dev_path, way5_dir+"/dev", 5)
+    _extract(test_path, way5_dir+"/test", 5)
+
 
 def main():
     action = sys.argv[1]
@@ -190,6 +238,9 @@ def main():
     elif action == "tokenize":
         folder = sys.argv[2]
         tokenize_data(folder)
+    elif action == "extract_paper":
+        # process the paper's data
+        extract_paper()
         
 
 if __name__ == "__main__":

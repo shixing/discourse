@@ -1156,7 +1156,8 @@ def model_with_buckets(encoder_inputs, decoder_inputs, targets, weights,
 
 def embedding_rnn_seq2seq_latent(encoder_inputs,
                                  decoder_inputs,
-                                 hidden_input,
+                                 hidden_input_1212,
+                                 hidden_input_1122,
                                  cell,
                                  num_encoder_symbols,
                                  num_decoder_symbols,
@@ -1213,12 +1214,16 @@ def embedding_rnn_seq2seq_latent(encoder_inputs,
     #else:
     #  dtype = scope.dtype
 
+
+    # config settings
     hidden_size = cell.output_size
     withDropout = env.config.getboolean("model","withDropout")
     dropoutRate = env.config.getfloat("model","dropoutRate")
     withSameEmbedding = env.config.getboolean("model","withSameEmbedding")
     withSameRNN = env.config.getboolean("model",'withSameRNN')
     withZeroInit = env.config.getboolean("model",'withZeroInit')
+    withCompact = env.config.getboolean("model","withCompact")
+    withContext = env.config.getboolean('model','withContext')
 
     # embeddings
     embedding_encoder = variable_scope.get_variable(
@@ -1260,32 +1265,31 @@ def embedding_rnn_seq2seq_latent(encoder_inputs,
       alpha = tf.get_variable("alpha", [1], dtype = logit.dtype, trainable = False, initializer = tf.constant_initializer(0.05))
       logit = alpha * logit + (1 - alpha) * logit_base
     
-
-    log_p_z =  - nn_ops.sparse_softmax_cross_entropy_with_logits(logit,hidden_input) # [batch_size * num_z]
+    if withCompact:
+      log_p_z = nn_ops.log_softmax(logit) #[batch_size, num_z]
+      log_p_z = array_ops.reshape(log_p_z,[-1])
+    else:
+      log_p_z =  - nn_ops.sparse_softmax_cross_entropy_with_logits(logit,hidden_input_1212) # [batch_size * num_z]
     
     
     # Decoder
-
-    z_softmax_projection = True
-
 
     if withDropout:
         decoder_cell = rnn_cell.DropoutWrapper(cell,input_keep_prob = dropoutRate, output_keep_prob = dropoutRate)
     else:
         decoder_cell = cell
 
-    if z_softmax_projection:
+    if not withCompact:
         w_zs = tf.get_variable("w_zs",[num_z, hidden_size * hidden_size])
         b_zs = tf.get_variable("b_zs",[num_z, num_decoder_symbols])
-        w_z = array_ops.reshape(embedding_ops.embedding_lookup(w_zs, hidden_input),[-1,hidden_size, hidden_size])
-        b_z = embedding_ops.embedding_lookup(b_zs, hidden_input)
+        w_z = array_ops.reshape(embedding_ops.embedding_lookup(w_zs, hidden_input_1212),[-1,hidden_size, hidden_size])
+        b_z = embedding_ops.embedding_lookup(b_zs, hidden_input_1212)
     
         projected_context = None
-        withContext = env.config.getboolean('model','withContext')
         if withContext:
             print("withContext")
             wc_zs = tf.get_variable("wc_zs",[num_z, hidden_size * hidden_size])
-            wc_z = array_ops.reshape(embedding_ops.embedding_lookup(wc_zs, hidden_input),[-1,hidden_size, hidden_size])
+            wc_z = array_ops.reshape(embedding_ops.embedding_lookup(wc_zs, hidden_input_1212),[-1,hidden_size, hidden_size])
 
             if withDropout:
                 encoder_state_dropout = tf.nn.dropout(encoder_state, dropoutRate)
@@ -1293,31 +1297,94 @@ def embedding_rnn_seq2seq_latent(encoder_inputs,
             else:
                 context = array_ops.reshape(encoder_state, [-1,1, cell.state_size])
 
-            projected_context = array_ops.reshape(tf.batch_matmul(context, wc_z),[-1,cell.state_size])
+            projected_context = array_ops.reshape(tf.batch_matmul(context, wc_z),[-1,hidden_size])
         
         with variable_scope.variable_scope("hidden_embedding"):
             hidden_scope = variable_scope.get_variable_scope()
 
         decoder_cell = rnn_cell_extension.OutputProjectionWrapperWithParameter(decoder_cell, num_decoder_symbols, w_z, b_z, projected_context = projected_context, embedding_scope = hidden_scope)
         
+    else:
+      # do nothing, decoder_cell's output is the hidden vectors.
+      pass
+      
+
     if withZeroInit:
         print("withZeroInit")
-        encoder_state = tf.zeros_like(encoder_state)
+        decoder_init_state = tf.zeros_like(encoder_state)
+    else:
+        decoder_init_state = encoder_state
 
     if withSameRNN:
         with variable_scope.variable_scope("RNN") as rnn_scope:
             variable_scope.get_variable_scope().reuse_variables()
             outputs, state = rnn_decoder(
-                emb_decoder_inputs, encoder_state, decoder_cell, scope = rnn_scope)
+                emb_decoder_inputs, decoder_init_state, decoder_cell, scope = rnn_scope)
     else:
         outputs, state = rnn_decoder(
-              emb_decoder_inputs, encoder_state, decoder_cell)
+              emb_decoder_inputs, decoder_init_state, decoder_cell)
+
+    # Till now:
+    # if withCompact == False:
+    #    outputs.shape = [[batch_size * num_z, num_decoder_variables]] * length
+    #    state.shape = [batch_size * num_z, hidden_size]
+    #    log_p_z.shape = [batch_size * num_z]
+    #
+    # if withComapce == True:
+    #    outputs.shape = [[batch_size, hidden_size]] * length
+    #    state.shape = [batch_size, hidden_size]
+    #    log_p_z.shape = [batch_size * num_z]
+    
+    if withCompact:
+      # process outputs : [batch_size, hidden_size] => [batch_size * num_z, num_decoder_variables]
+
+      
+      w_zs = tf.get_variable("w_zs",[num_z, hidden_size * hidden_size])
+      b_zs = tf.get_variable("b_zs",[num_z, num_decoder_symbols])
+      w_z = array_ops.reshape(embedding_ops.embedding_lookup(w_zs, hidden_input_1212),[-1,hidden_size, hidden_size])
+      b_z = embedding_ops.embedding_lookup(b_zs, hidden_input_1212)
+
+      embedding_wo = tf.get_variable("embedding_wo",[hidden_size,num_decoder_symbols])
+      
+      if withContext:
+        print("withContext")
+        embedding_wc = tf.get_variable("embedding_wc",[hidden_size,num_decoder_symbols])
+        wc_zs = tf.get_variable("wc_zs",[num_z, hidden_size * hidden_size])
+        wc_z = array_ops.reshape(embedding_ops.embedding_lookup(wc_zs, hidden_input_1212),[-1,hidden_size, hidden_size])
+
+        if withDropout:
+          encoder_state_reshape = tf.nn.dropout(encoder_state, dropoutRate)
+        else:
+          encoder_state_reshape = encoder_state
+
+        encoder_state_reshape = embedding_ops.embedding_lookup(encoder_state_reshape,hidden_input_1122)
+        encoder_state_reshape = array_ops.reshape(encoder_state_reshape, [-1,1, hidden_size])
+
+        projected_context = array_ops.reshape(tf.batch_matmul(encoder_state_reshape, wc_z),[-1,hidden_size])
+
+        context_logit = tf.matmul(projected_context, embedding_wc)
+        
+
+      temp_outputs = []
+      for output in outputs:
+        output = embedding_ops.embedding_lookup(output,hidden_input_1122)
+        outputr = array_ops.reshape(output, [-1,1, hidden_size])
+        projected = tf.batch_matmul(outputr, w_z)
+        projected = array_ops.reshape(projected, [-1, hidden_size])
+        if withContext:
+          projected = tf.matmul(projected, embedding_wo) + context_logit +  b_z
+        else:
+          projected = tf.matmul(projected, embedding_wo) + b_z
+        temp_outputs.append(projected)
+
+      outputs = temp_outputs
+
     return outputs, state, log_p_z
 
 
 
 
-def model_with_buckets_latent(encoder_inputs, decoder_inputs, hidden_input, targets, weights,
+def model_with_buckets_latent(encoder_inputs, decoder_inputs, targets, weights,
                        buckets, seq2seq, softmax_loss_function=None,
                        per_example_loss=True, name=None):
   """Create a sequence-to-sequence model with support for bucketing.
@@ -1355,6 +1422,10 @@ def model_with_buckets_latent(encoder_inputs, decoder_inputs, hidden_input, targ
     ValueError: If length of encoder_inputsut, targets, or weights is smaller
       than the largest (last) bucket.
   """
+
+  # config settings
+  withCompact = env.config.getboolean("model","withCompact")
+
   if len(encoder_inputs) < buckets[-1][0]:
     raise ValueError("Length of encoder_inputs (%d) must be at least that of la"
                      "st bucket (%d)." % (len(encoder_inputs), buckets[-1][0]))
@@ -1374,7 +1445,7 @@ def model_with_buckets_latent(encoder_inputs, decoder_inputs, hidden_input, targ
       with variable_scope.variable_scope(variable_scope.get_variable_scope(),
                                          reuse=True if j > 0 else None):
         bucket_outputs, _, log_p_z = seq2seq(encoder_inputs[:bucket[0]],
-                                    decoder_inputs[:bucket[1]],hidden_input)
+                                    decoder_inputs[:bucket[1]])
         outputs.append(bucket_outputs)
         log_p_zs.append(log_p_z)
         if per_example_loss:
@@ -1386,6 +1457,7 @@ def model_with_buckets_latent(encoder_inputs, decoder_inputs, hidden_input, targ
               outputs[-1], targets[:bucket[1]], weights[:bucket[1]],
               softmax_loss_function=softmax_loss_function))
 
+  
   return outputs, losses, log_p_zs
 
 

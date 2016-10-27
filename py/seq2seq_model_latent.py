@@ -156,22 +156,40 @@ class Seq2SeqModel(object):
         dtype: the data type to use to store internal variables.
         """
 
+        withCompact = env.config.getboolean("model",'withCompact')
+        
         self.source_vocab_size = source_vocab_size
         self.target_vocab_size = target_vocab_size
         self.num_z = num_z
         self.buckets = buckets
-        self.batch_size = batch_size
-        assert(self.batch_size % self.num_z == 0)
-        self.real_batch_size = int(self.batch_size / self.num_z)
+        self.real_batch_size = batch_size
+        
+        if withCompact:
+            self.batch_size = self.real_batch_size
+        else:
+            self.batch_size = self.real_batch_size * self.num_z
+
         self.learning_rate = tf.Variable(
             float(learning_rate), trainable=False, dtype=dtype)
         self.learning_rate_decay_op = self.learning_rate.assign(
             self.learning_rate * learning_rate_decay_factor)
         self.global_step = tf.Variable(0, trainable=False)
 
-        
         # create np_hidden_input
-        self.np_hidden_input = np.array(range(self.num_z) * int(self.real_batch_size))
+        self.np_hidden_input_1212 = np.array(range(self.num_z) * int(self.real_batch_size))
+        self.hidden_input_1212 = tf.constant(self.np_hidden_input_1212)
+
+
+        temp = []
+        for i in xrange(self.real_batch_size):
+            for j in xrange(self.num_z):
+                temp.append(i)
+        self.np_hidden_input_1122 = np.array(temp)
+        self.hidden_input_1122 = tf.constant(self.np_hidden_input_1122)
+            
+        
+
+        
 
         # If we use sampled softmax, we need an output projection.
         output_projection = None
@@ -186,11 +204,12 @@ class Seq2SeqModel(object):
             cell = tf.nn.rnn_cell.MultiRNNCell([single_cell] * num_layers)
 
         # The seq2seq function: we use embedding for the input and attention.
-        def seq2seq_f(encoder_inputs, decoder_inputs, hidden_input, do_decode):
+        def seq2seq_f(encoder_inputs, decoder_inputs, do_decode):
             return seq2seq.embedding_rnn_seq2seq_latent(
                 encoder_inputs,
                 decoder_inputs,
-                hidden_input,
+                self.hidden_input_1212,
+                self.hidden_input_1122,
                 cell,
                 num_encoder_symbols=source_vocab_size,
                 num_decoder_symbols=target_vocab_size,
@@ -206,23 +225,43 @@ class Seq2SeqModel(object):
         self.decoder_inputs = []
         self.target_weights = []
         for i in xrange(buckets[-1][0]):  # Last bucket is the biggest one.
-            self.encoder_inputs.append(tf.placeholder(tf.int32, shape=[batch_size],
+            self.encoder_inputs.append(tf.placeholder(tf.int32, shape=[self.batch_size],
                                                     name="encoder{0}".format(i)))
         for i in xrange(buckets[-1][1] + 1):
-            self.decoder_inputs.append(tf.placeholder(tf.int32, shape=[batch_size],
+            self.decoder_inputs.append(tf.placeholder(tf.int32, shape=[self.batch_size],
                                                     name="decoder{0}".format(i)))
-            self.target_weights.append(tf.placeholder(dtype, shape=[batch_size],
+            
+            self.target_weights.append(tf.placeholder(dtype, shape=[self.batch_size],
                                                     name="weight{0}".format(i)))
 
-        self.hidden_input = tf.placeholder(tf.int32, shape = [batch_size], name = "z")
-        self.previous_post_z = tf.placeholder(tf.float32, shape = [batch_size], name = "previous_post_z")
+        if withCompact:
+            self.previous_post_z = tf.placeholder(tf.float32, shape = [self.batch_size * self.num_z], name = "previous_post_z")
+        else:
+            self.previous_post_z = tf.placeholder(tf.float32, shape = [self.batch_size], name = "previous_post_z")
 
         # Our targets are decoder inputs shifted by one.
-        targets = [self.decoder_inputs[i + 1]
+        self.targets = [self.decoder_inputs[i + 1]
                    for i in xrange(len(self.decoder_inputs) - 1)]
 
-        # Training outputs and losses.
-        self.outputs, self.losses, self.log_p_zs = seq2seq.model_with_buckets_latent(self.encoder_inputs, self.decoder_inputs, self.hidden_input, targets,self.target_weights, buckets, lambda x, y, z: seq2seq_f(x, y, z, False),softmax_loss_function=softmax_loss_function, per_example_loss = True)
+
+        if withCompact:
+            # expand target_weight and targets
+            temp_targets = []
+            for target in self.targets:
+                target_expand = embedding_ops.embedding_lookup(target,self.hidden_input_1122)
+                temp_targets.append(target_expand)
+
+            temp_target_weights = []
+            for target_weight in self.target_weights:
+                target_weight_expand = embedding_ops.embedding_lookup(target_weight,self.hidden_input_1122)
+                temp_target_weights.append(target_weight_expand)
+
+            # Training outputs and losses.                
+            self.outputs, self.losses, self.log_p_zs = seq2seq.model_with_buckets_latent(self.encoder_inputs, self.decoder_inputs, temp_targets, temp_target_weights, buckets, lambda x, y: seq2seq_f(x, y, False),softmax_loss_function=softmax_loss_function, per_example_loss = True)
+
+        else:
+            # Training outputs and losses.
+            self.outputs, self.losses, self.log_p_zs = seq2seq.model_with_buckets_latent(self.encoder_inputs, self.decoder_inputs, self.targets, self.target_weights, buckets, lambda x, y: seq2seq_f(x, y, False),softmax_loss_function=softmax_loss_function, per_example_loss = True)
 
         # for post_z, Q and L 
         self.post_zs = []
@@ -293,7 +332,7 @@ class Seq2SeqModel(object):
             raise ValueError("Decoder length must be equal to the one in bucket,"" %d != %d." % (len(decoder_inputs), decoder_size))
         if len(target_weights) != decoder_size:
             raise ValueError("Weights length must be equal to the one in bucket,"" %d != %d." % (len(target_weights), decoder_size))
-
+        
         # Input feed: encoder inputs, decoder inputs, target_weights, as provided.
         input_feed = {}
         for l in xrange(encoder_size):
@@ -305,16 +344,20 @@ class Seq2SeqModel(object):
         # Since our targets are decoder inputs shifted by one, we need one more.
         last_target = self.decoder_inputs[decoder_size].name
         input_feed[last_target] = np.zeros([self.batch_size], dtype=np.int32)
-
-        # for hidden_input and previous_post_z
-        input_feed[self.hidden_input.name] = self.np_hidden_input
         
+        withCompact = env.config.getboolean("model",'withCompact')
         
         # for previous_post_z
         if labeled:
-            post_z = np.zeros((len(true_hidden_inputs),))
-            for i in xrange(0,len(true_hidden_inputs)):
-                post_z[i] = 1.0 if i % self.num_z == true_hidden_inputs[i][0] else 0.0            
+            if withCompact:
+                post_z = np.zeros((len(true_hidden_inputs)*self.num_z,))
+                for i in xrange(0,len(true_hidden_inputs)):
+                    j = i * self.num_z + true_hidden_inputs[i][0]
+                    post_z[j] = 1.0 
+            else:
+                post_z = np.zeros((len(true_hidden_inputs),))
+                for i in xrange(0,len(true_hidden_inputs)):
+                    post_z[i] = 1.0 if i % self.num_z == true_hidden_inputs[i][0] else 0.0            
             input_feed[self.previous_post_z.name] = post_z
 
         # Output feed: depends on whether we do a backward step or not.
@@ -437,13 +480,16 @@ class Seq2SeqModel(object):
                     expand[i * n + j] = arr[i]
             return expand
 
-        zs = expand_n(np.array(zs), num_z)
+
+        withCompact = env.config.getboolean("model","withCompact")
 
         # expand num_z 
-        for l in xrange(encoder_size):
-            batch_encoder_inputs[l] = expand_n(batch_encoder_inputs[l],num_z)
-        for l in xrange(decoder_size):
-            batch_decoder_inputs[l] = expand_n(batch_decoder_inputs[l],num_z)
-            batch_weights[l] = expand_n(batch_weights[l],num_z)
+        if not withCompact:
+            for l in xrange(encoder_size):
+                batch_encoder_inputs[l] = expand_n(batch_encoder_inputs[l],num_z)
+            for l in xrange(decoder_size):
+                batch_decoder_inputs[l] = expand_n(batch_decoder_inputs[l],num_z)
+                batch_weights[l] = expand_n(batch_weights[l],num_z)
+            zs = expand_n(np.array(zs), num_z)
 
         return batch_encoder_inputs, batch_decoder_inputs, batch_weights, zs
