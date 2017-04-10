@@ -1,3 +1,4 @@
+
 import os
 
 root_dir="/Users/xingshi/Workspace/misc/lstm/tensorflow/discourse/"

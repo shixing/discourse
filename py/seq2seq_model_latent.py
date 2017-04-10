@@ -49,17 +49,32 @@ def compute_post_Q_L(log_p_y_gv_z_x, log_p_z_gv_x, previous_post_z, num_z):
         log_p_z_gv_x: logP(z|x), of shape [batch_size * num_z]
     """
     
+    withDummy = env.config.getboolean("model",'withDummy')
+
+    if withDummy: 
+        log_p_z_gv_x = array_ops.reshape(log_p_z_gv_x,[-1, num_z - 1])
+        zero = tf.zeros([tf.shape(log_p_z_gv_x)[0],1],tf.float32)
+        log_p_z_gv_x = tf.concat(1, [zero, log_p_z_gv_x])
+        log_p_z_gv_x = array_ops.reshape(log_p_z_gv_x,[-1])
+
     log_p_y_z_gv_x = log_p_y_gv_z_x + log_p_z_gv_x
     log_p_y_z_gv_x_reshape = array_ops.reshape(log_p_y_z_gv_x, [-1, num_z])
+
+
+    # if withDummy, the unlabled L and Q and post_z is not correct, but we still can predict using post_z;
 
     # unlabeled L
     uL = math_ops.reduce_sum(tf.log(math_ops.reduce_sum(tf.exp(log_p_y_z_gv_x_reshape), 1)))
 
     post_z = tf.nn.softmax(log_p_y_z_gv_x_reshape)
     post_z = array_ops.reshape(post_z,[-1])
+
     # unlabeled Q
     post_z_copy = tf.stop_gradient(post_z)
     uQ = math_ops.reduce_sum(log_p_y_z_gv_x * post_z_copy)
+
+    
+
 
     # labeled Q
     lQ = math_ops.reduce_sum(log_p_y_z_gv_x * previous_post_z)
@@ -76,8 +91,17 @@ def compute_post_Q_L_avg(log_p_y_gv_z_x, log_p_z_gv_x, previous_post_z, num_z):
         log_p_y_gv_z_x: logP(y|z,x), of shape [batch_size * num_z]
         log_p_z_gv_x: logP(z|x), of shape [batch_size * num_z]
     """
-    log_p_z_uniform = tf.constant(np.log(1.0/num_z), shape=log_p_z_gv_x.get_shape(), dtype=log_p_z_gv_x.dtype)
-    log_p_y_z_gv_x = log_p_y_gv_z_x + log_p_z_uniform
+
+    withDummy = env.config.getboolean("model",'withDummy')
+    if withDummy: 
+        log_p_z_uniform = tf.constant(np.log(1.0/(num_z-1)), shape=log_p_z_gv_x.get_shape(), dtype=log_p_z_gv_x.dtype)
+        log_p_y_z_gv_x = log_p_y_gv_z_x + log_p_z_uniform
+        zero = tf.constant([tf.shape(log_p_z_gv_x),1])
+        log_p_z_gv_x = tf.concat(1, [zero, log_p_z_gv_x])
+    else:
+        log_p_z_uniform = tf.constant(np.log(1.0/num_z), shape=log_p_z_gv_x.get_shape(), dtype=log_p_z_gv_x.dtype)
+        log_p_y_z_gv_x = log_p_y_gv_z_x + log_p_z_uniform
+
     log_p_y_z_gv_x_reshape = array_ops.reshape(log_p_y_z_gv_x, [-1, num_z])
 
     # unlabeled L
@@ -164,10 +188,15 @@ class Seq2SeqModel(object):
         self.buckets = buckets
         self.real_batch_size = batch_size
         
+
         if withCompact:
             self.batch_size = self.real_batch_size
         else:
             self.batch_size = self.real_batch_size * self.num_z
+        
+        dropoutRateRaw = env.config.getfloat("model","dropoutRate")
+        self.dropoutRate = tf.Variable(
+            float(dropoutRateRaw), trainable=False, dtype=dtype)
 
         self.learning_rate = tf.Variable(
             float(learning_rate), trainable=False, dtype=dtype)
@@ -196,12 +225,20 @@ class Seq2SeqModel(object):
         softmax_loss_function = None
 
         # Create the internal multi-layer cell for our RNN.
-        single_cell = tf.nn.rnn_cell.GRUCell(size)
+        withLSTM = env.config.getboolean('model','withLSTM')
+        if withLSTM:
+            single_cell = tf.nn.rnn_cell.LSTMCell(size, state_is_tuple=True)
+        else:
+            single_cell = tf.nn.rnn_cell.GRUCell(size)
+        
         if use_lstm:
             single_cell = tf.nn.rnn_cell.BasicLSTMCell(size)
         cell = single_cell
         if num_layers > 1:
             cell = tf.nn.rnn_cell.MultiRNNCell([single_cell] * num_layers)
+
+        K = env.config.getint('model','K')
+        
 
         # The seq2seq function: we use embedding for the input and attention.
         def seq2seq_f(encoder_inputs, decoder_inputs, do_decode):
@@ -214,11 +251,11 @@ class Seq2SeqModel(object):
                 num_encoder_symbols=source_vocab_size,
                 num_decoder_symbols=target_vocab_size,
                 num_z = self.num_z,
-                embedding_size=size,
+                embedding_size=K,
                 output_projection=output_projection,
                 feed_previous=do_decode,
-                dtype=dtype)
-
+                dtype=dtype,
+                dropoutRate = self.dropoutRate)
         
         # Feeds for inputs.
         self.encoder_inputs = []
@@ -238,7 +275,7 @@ class Seq2SeqModel(object):
             self.previous_post_z = tf.placeholder(tf.float32, shape = [self.batch_size * self.num_z], name = "previous_post_z")
         else:
             self.previous_post_z = tf.placeholder(tf.float32, shape = [self.batch_size], name = "previous_post_z")
-
+            
         # Our targets are decoder inputs shifted by one.
         self.targets = [self.decoder_inputs[i + 1]
                    for i in xrange(len(self.decoder_inputs) - 1)]
@@ -271,9 +308,9 @@ class Seq2SeqModel(object):
         self.lLs = []
         self.log_p_y_gv_zs = []
         for i in xrange(len(self.outputs)):
-            output = self.outputs[i]
+            #output = self.outputs[i]
             loss = self.losses[i]
-            log_p_y_gv_z = -loss
+            log_p_y_gv_z = -loss #[real_batch_size * num_z]
             log_p_z = self.log_p_zs[i]
             self.log_p_y_gv_zs.append(log_p_y_gv_z)
 
@@ -307,7 +344,7 @@ class Seq2SeqModel(object):
                                                              max_gradient_norm)
                 self.gradient_norms_u.append(norm)
                 self.updates_u.append(opt.apply_gradients(zip(clipped_gradients, params), global_step=self.global_step))
-
+                
             
             for b in xrange(len(buckets)):
                 gradients = tf.gradients(-self.lQs[b], params)
@@ -346,14 +383,20 @@ class Seq2SeqModel(object):
         input_feed[last_target] = np.zeros([self.batch_size], dtype=np.int32)
         
         withCompact = env.config.getboolean("model",'withCompact')
+        withBalance = env.config.getboolean("model",'withBalance')
         
         # for previous_post_z
         if labeled:
             if withCompact:
                 post_z = np.zeros((len(true_hidden_inputs)*self.num_z,))
+                vals = [1.0,1.0,2.0,3.57,10.1]
                 for i in xrange(0,len(true_hidden_inputs)):
+                    if withBalance:
+                        val = vals[true_hidden_inputs[i][0]]
+                    else:
+                        val = 1.0
                     j = i * self.num_z + true_hidden_inputs[i][0]
-                    post_z[j] = 1.0 
+                    post_z[j] = val 
             else:
                 post_z = np.zeros((len(true_hidden_inputs),))
                 for i in xrange(0,len(true_hidden_inputs)):

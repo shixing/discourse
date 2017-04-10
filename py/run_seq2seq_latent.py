@@ -56,6 +56,8 @@ import env
 _buckets = [(10, 10),(20, 20),(30, 30),(40, 40),(60,60),(100,100)]
 
 
+
+
 def read_data(source_path, target_path, hidden_path, max_size=None):
     """Read data from source and target files and put into buckets.
 
@@ -74,7 +76,9 @@ def read_data(source_path, target_path, hidden_path, max_size=None):
         into the n-th bucket, i.e., such that len(source) < _buckets[n][0] and
         len(target) < _buckets[n][1]; source and target are lists of token-ids.
     """
+
     data_set = [[] for _ in _buckets]
+    order = []
     with tf.gfile.GFile(source_path, mode="r") as source_file:
         with tf.gfile.GFile(target_path, mode="r") as target_file:
             with tf.gfile.GFile(hidden_path,mode="r") as hidden_file:
@@ -92,9 +96,10 @@ def read_data(source_path, target_path, hidden_path, max_size=None):
                     for bucket_id, (source_size, target_size) in enumerate(_buckets):
                         if len(source_ids) < source_size and len(target_ids) < target_size:
                             data_set[bucket_id].append([source_ids, target_ids, z_id])
+                            order.append([bucket_id,len(data_set[bucket_id]) - 1])
                             break
                     source, target, z = source_file.readline(), target_file.readline(), hidden_file.readline()
-    return data_set
+    return data_set, order
 
 
 def create_model(session, forward_only):
@@ -128,10 +133,73 @@ def show_all_variables():
     for var in all_vars:
         print(var.name)
 
+class DataIterator:
+    def __init__(self, model,data_set, n_bucket, num_z, batch_size, train_buckets_scale, order):
+        self.data_set = data_set
+        self.n_bucket = n_bucket
+        self.num_z = num_z
+        self.batch_size = batch_size
+        self.train_buckets_scale = train_buckets_scale
+        self.model = model
+        self.order = order
+    
+
+
+    def next_random(self):
+        while True:
+            random_number_01 = np.random.random_sample()
+            bucket_id = min([i for i in xrange(len(self.train_buckets_scale))
+                             if self.train_buckets_scale[i] > random_number_01])
+
+            encoder_inputs, decoder_inputs, target_weights, hiddens = self.model.get_batch(self.data_set, bucket_id, num_z = self.num_z)
+            yield encoder_inputs, decoder_inputs, target_weights, hiddens, bucket_id
+
+    def next_sequence(self):
+        bucket_id = 0
+        while True:
+            if bucket_id >= self.n_bucket:
+                bucket_id = 0
+            start_id = 0
+            while True:
+                encoder_inputs, decoder_inputs, target_weights, hiddens = self.model.get_batch(self.data_set, bucket_id, start_id = start_id, num_z = self.num_z)
+                if encoder_inputs == None:
+                    break
+                start_id += self.batch_size
+                yield encoder_inputs, decoder_inputs, target_weights, hiddens, bucket_id
+            bucket_id += 1
+           
+    def next_sequence_continous(self):
+        index = 0
+        while True:
+            if index >= len(self.order):
+                index = 0
+            bucket_id, start_id = self.order[index]
+            index += 1
+            encoder_inputs, decoder_inputs, target_weights, hiddens = self.model.get_batch(self.data_set, bucket_id, start_id = start_id, num_z = self.num_z)
+            print(index)
+            yield encoder_inputs, decoder_inputs, target_weights, hiddens, bucket_id
+           
+
+
+
+def random_data_generator(train_set, num_z, train_buckets_scale):
+    random_number_01 = np.random.random_sample()
+    bucket_id = min([i for i in xrange(len(train_buckets_scale))
+                     if train_buckets_scale[i] > random_number_01])
+
+    encoder_inputs, decoder_inputs, target_weights, hiddens = model.get_batch(train_set, bucket_id, num_z = num_z)
+
+    return encoder_inputs, decoder_inputs, target_weights, hiddens
+
+def sequence_data_generator(train_set, num_z, bucket_id, start_id):
+    encoder_inputs, decoder_inputs, target_weights, hiddens = model.get_batch(train_set, bucket_id, start_id = start_id, num_z = num_z)
+    
+
+    
+
 
 def train():
     np.set_printoptions(suppress=True)
-
 
     """Train a en->fr translation model using WMT data."""
     # Prepare WMT data.
@@ -145,14 +213,13 @@ def train():
         model = create_model(sess, False)
         
         show_all_variables()
-        
-
 
         # Read data into buckets and compute their sizes.
         print ("Reading development and training data (limit: %d)."
                % env.config.getint("model","max_train_data_size"))
-        dev_set = read_data(en_dev, fr_dev, type_dev)
-        train_set = read_data(en_train, fr_train, type_train, max_size = None)
+        dev_set, _ = read_data(en_dev, fr_dev, type_dev)
+        #dev_set, _ = read_data(en_test, fr_test, type_test)
+        train_set, train_order = read_data(en_train, fr_train, type_train, max_size = None)
         #test_set = read_data(en_test, fr_test, type_test, env.config.getint("model",.max_train_data_size)
         train_bucket_sizes = [len(train_set[b]) for b in xrange(len(_buckets))]
         train_total_size = int(sum(train_bucket_sizes))
@@ -161,8 +228,6 @@ def train():
 
         dev_bucket_sizes = [len(dev_set[b]) for b in xrange(len(_buckets))]
         dev_total_size = int(sum(dev_bucket_sizes))
-
-
 
         # set env.config.getint("model",.steps_per_checkpoint = half/ epoch
 
@@ -200,16 +265,30 @@ def train():
         low_ppx = 10000000
         low_ppx_step = 0
 
+        dite = DataIterator(model, train_set, len(train_buckets_scale),num_z, batch_size, train_buckets_scale, train_order)
+        
+        iteType = env.config.getint('model','iteType')
+        if iteType == 0:
+            print("withRandom")
+            ite = dite.next_random()
+        elif iteType == 1:
+            print("withSequence")
+            ite = dite.next_sequence()
+        elif iteType == 2:
+            print("withOrder")
+            assert(batch_size == 1)
+            ite = dite.next_sequence_continous()
+
         while current_step < total_steps:
 
             # for training data
             if with_labeled_data: 
-                random_number_01 = np.random.random_sample()
-                bucket_id = min([i for i in xrange(len(train_buckets_scale))
-                                 if train_buckets_scale[i] > random_number_01])
+                
                 start_time = time.time()
 
-                encoder_inputs, decoder_inputs, target_weights, hiddens = model.get_batch(train_set, bucket_id, num_z = num_z)
+                encoder_inputs, decoder_inputs, target_weights, hiddens, bucket_id = ite.next()
+                
+                print(len(encoder_inputs))
 
                 _,_,_,L,norm,Q = model.batch_step(sess, encoder_inputs, decoder_inputs, target_weights, bucket_id, labeled = True, true_hidden_inputs = hiddens)
                 step_time += (time.time() - start_time) / steps_per_checkpoint
@@ -229,11 +308,7 @@ def train():
                     print("Saving model....")
                     model.saver.save(sess, checkpoint_path, global_step=model.global_step)
                 step_time, loss = 0.0, 0.0
-                
-                
-                
-                
-                
+                                
                 # dev data
                 print("--------------------","DEV",current_step,"-------------------")
                 Q, L, cost, accuracy, eval_ppx = evaluate(sess, model, dev_set, _buckets, name="dev", show_stat = True, show_basic = True, show_sample = True)
@@ -312,6 +387,13 @@ def precision_and_recall(gold_z,predict_z,num_z, omit_0 = False):
 
 def evaluate(sess, model, data_set, _buckets, name = 'test',show_sample = False, show_stat = False,  show_basic = False):
     # Run evals on development set and print their perplexity.
+    
+    withDropout = env.config.getboolean("model","withDropout")
+    dropoutRateRaw = env.config.getfloat("model","dropoutRate")
+    
+    if withDropout:        
+        sess.run(model.dropoutRate.assign(1.0))
+
     start_id = 0
     sum_eval_loss = 0
     sum_eval_Q = 0
@@ -320,13 +402,19 @@ def evaluate(sess, model, data_set, _buckets, name = 'test',show_sample = False,
     num_z = env.config.getint("model","num_z")
     batch_size = env.config.getint("model","batch_size")
     withCompact = env.config.getboolean("model","withCompact")
+    withDummy = env.config.getboolean("model","withDummy")
     n = 0
     accuracy = 0
     predict_z = []
     gold_z = []
     post_z_avg = np.zeros((num_z, num_z))
 
-    
+    n_predict = num_z
+    if withDummy:
+        n_predict = num_z - 1
+        
+
+
     for bucket_id in xrange(len(_buckets)):
         if len(data_set[bucket_id]) == 0:
             #print("  eval: empty bucket %d" % (bucket_id))
@@ -364,7 +452,7 @@ def evaluate(sess, model, data_set, _buckets, name = 'test',show_sample = False,
                         print("z",z_type)
                         #print(np.array(encoder_inputs).T[i])
                         #print(np.array(decoder_inputs).T[i])         
-                        print("p(z|x)", np.exp(log_p_z.reshape([-1,num_z])[i]))
+                        print("p(z|x)", np.exp(log_p_z.reshape([-1,n_predict])[i]))
                         print("p(y|z,x)",np.exp(log_p_y_gv_z.reshape([-1,num_z])[i]))
                         print("p(z|x,y)",post_z.reshape([-1,num_z])[i])
 
@@ -381,7 +469,7 @@ def evaluate(sess, model, data_set, _buckets, name = 'test',show_sample = False,
                         print("z",z_type)
                         #print(np.array(encoder_inputs).T[i])
                         #print(np.array(decoder_inputs).T[i])         
-                        print("p(z|x)", np.exp(log_p_z.reshape([-1,num_z])[int(i/num_z)]))
+                        print("p(z|x)", np.exp(log_p_z.reshape([-1,n_predict])[int(i/num_z)]))
                         print("p(y|z,x)",np.exp(log_p_y_gv_z.reshape([-1,num_z])[int(i/num_z)]))
                         print("p(z|x,y)",post_z.reshape([-1,num_z])[int(i/num_z)])
 
@@ -429,6 +517,11 @@ def evaluate(sess, model, data_set, _buckets, name = 'test',show_sample = False,
         print(name,": L %.4f" % (L))
         print()
 
+
+    if withDropout:        
+        sess.run(model.dropoutRate.assign(dropoutRateRaw))
+
+
     return Q, L, cost, accuracy, eval_ppx
     
 
@@ -457,8 +550,19 @@ def main(_):
     config = configparser.ConfigParser()
     config._interpolation = configparser.ExtendedInterpolation()
     config.read(sys.argv[1])
+
+    for i in xrange(2, len(sys.argv)):
+        ll = sys.argv[i].split('=')
+        key = ll[0]
+        val = ll[1]
+        config.set('model', key, val)
+
     env.config = config
     gpu_name = env.config.get("model", "gpu_name")
+
+    print("K=",env.config.getint('model','K'))
+    print("size=",env.config.getint('model','size'))
+
     with tf.device(gpu_name):
         print("on GPU: ", gpu_name)
         train()

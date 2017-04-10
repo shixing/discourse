@@ -188,12 +188,12 @@ def extract_paper():
         for line in f:
             if line.startswith("=== "):
                 # process buff
-                for i in xrange(len(rls)-1):
+                for i in xrange(1,len(rls)):
                     rl = rls[i]
                     if nway == 4 and rl == -1:
                         continue
-                    arg1 = sents[i]
-                    arg2 = sents[i+1]
+                    arg1 = sents[i-1]
+                    arg2 = sents[i]
                     f1.write(arg1+"\n")
                     f2.write(arg2+"\n")
                     frl.write(str(rl)+"\n")
